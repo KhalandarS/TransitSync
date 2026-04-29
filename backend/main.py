@@ -1,46 +1,108 @@
 """
-Bus Bunching Control System - FastAPI Backend with WebSocket Server
-Real intercity route with OpenStreetMap integration.
-Prevents bunching from occurring (aggressive algorithm).
+Bus Tracking & Alert System - FastAPI Backend
+7 buses on the Tumkur-Bangalore highway route in India.
+Real-time tracking with proximity alerts (5-10 km) and admin controls.
 """
 
 import asyncio
 import json
 import math
-from dataclasses import dataclass, asdict
+import random
+from dataclasses import dataclass, asdict, field
 from typing import Dict, List, Set, Tuple
 from datetime import datetime
+from enum import Enum
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 
 # ============================================================================
+# TUMKUR-BANGALORE HIGHWAY ROUTE WAYPOINTS (NH48)
+# ============================================================================
+
+# Highway NH48 from Tumkur to Bangalore - correct coordinates following the actual road
+# Latitude decreases (south) and Longitude increases (east) as we go from Tumkur to Bangalore
+HIGHWAY_WAYPOINTS = [
+    # Tumkur (start)
+    (13.3426, 77.1023),
+    (13.3300, 77.1200),
+    (13.3150, 77.1450),
+    (13.2980, 77.1700),
+    (13.2800, 77.1950),
+    (13.2600, 77.2200),
+    (13.2350, 77.2450),
+    (13.2100, 77.2700),
+    (13.1850, 77.2950),
+    (13.1600, 77.3200),
+    (13.1350, 77.3450),
+    (13.1100, 77.3700),
+    (13.0900, 77.3950),
+    (13.0700, 77.4200),
+    (13.0500, 77.4450),
+    (13.0300, 77.4700),
+    (13.0100, 77.4950),
+    (12.9950, 77.5200),
+    (12.9800, 77.5450),
+    # Bangalore (end)
+    (12.9716, 77.5946),
+]
+
+# ============================================================================
 # DATA STRUCTURES
 # ============================================================================
 
+class BusStatus(str, Enum):
+    """Bus operational status."""
+    IDLE = "idle"
+    MOVING = "moving"
+    BOARDING = "boarding"
+    STOPPED = "stopped"
+    ALERT = "alert"
+
+
 @dataclass
-class Stop:
-    """Bus stop with GPS coordinates."""
-    id: str
-    name: str
+class Location:
+    """GPS location."""
     latitude: float
     longitude: float
-    sequence: int
+    
+    def distance_to(self, other: 'Location') -> float:
+        """Calculate distance in km using Haversine formula."""
+        R = 6371  # Earth radius in km
+        dlat = math.radians(other.latitude - self.latitude)
+        dlon = math.radians(other.longitude - self.longitude)
+        a = (math.sin(dlat/2) ** 2 + 
+             math.cos(math.radians(self.latitude)) * math.cos(math.radians(other.latitude)) * 
+             math.sin(dlon/2) ** 2)
+        c = 2 * math.asin(math.sqrt(a))
+        return R * c
 
 
 @dataclass
 class Bus:
-    """Represents a single bus with real coordinates."""
+    """Represents a single bus with GPS coordinates."""
     id: str
-    current_stop_idx: int  # Index in STOPS list (0-7)
-    progress_to_next: float  # 0-1 progress from current to next stop
-    latitude: float  # Current GPS position
-    longitude: float  # Current GPS position
-    status: str  # "moving", "boarding", "holding"
-    speed_multiplier: float  # 1.0 = normal, 0.4 = delayed, 2.0 = express
-    boarding_counter: int = 0
-    holding_counter: int = 0
-    distance_to_next_stop: float = 0.0  # km
+    name: str
+    latitude: float
+    longitude: float
+    destination_lat: float
+    destination_lon: float
+    status: str
+    speed: float  # km/h
+    heading: float  # degrees
+    alert_level: str  # "none", "warning", "critical"
+    closest_bus_id: str
+    closest_distance_km: float
+    waypoint_index: int  # Current waypoint index on the route
+    progress_on_segment: float  # Progress from 0 to 1 on current waypoint
+    current_route: list = field(default=None)  # Current route waypoints
+    alternative_routes: list = field(default=None)  # List of alternative route options
+    
+    def current_location(self) -> Location:
+        return Location(self.latitude, self.longitude)
+    
+    def destination_location(self) -> Location:
+        return Location(self.destination_lat, self.destination_lon)
 
 
 # ============================================================================
@@ -51,86 +113,70 @@ class SimulationState:
     """Manages the global state of the bus system."""
     
     def __init__(self):
-        # Real intercity route: e.g., between nearby cities (8 stops, ~20 km)
-        # Using realistic GPS coordinates (example: a highway corridor)
-        self.STOPS = [
-            Stop("stop_1", "Central Station A", 40.7380, -74.0420, 0),
-            Stop("stop_2", "Transit Hub", 40.7489, -74.0278, 1),
-            Stop("stop_3", "City Center", 40.7549, -74.0152, 2),
-            Stop("stop_4", "North Plaza", 40.7614, -74.0055, 3),
-            Stop("stop_5", "Commercial District", 40.7505, -73.9934, 4),
-            Stop("stop_6", "Airport Junction", 40.7382, -73.9862, 5),
-            Stop("stop_7", "Business Park", 40.7282, -73.9876, 6),
-            Stop("stop_8", "Central Station B", 40.7128, -74.0060, 7),
-        ]
+        # Configuration
+        self.NUM_BUSES = 5
+        self.BASE_SPEED = 250  # km/h - very fast for demo
+        self.BOARDING_TIME = 2  # seconds
+        self.TICK_INTERVAL = 1.0  # seconds
         
-        # Route parameters
-        self.BOARDING_DURATION = 3  # Faster boarding (3 sec) in modern system
-        self.BASE_SPEED = 2.0  # km per tick (~40 km/h with 1-sec ticks)
-        self.TICK_INTERVAL = 1.0  # Seconds between ticks
+        # Proximity alert thresholds (km)
+        self.ALERT_CRITICAL = 5.0  # Critical: < 5 km
+        self.ALERT_WARNING = 10.0  # Warning: 5-10 km
         
-        # Event log for frontend display (initialize BEFORE _initialize_buses)
+        # Route waypoints
+        self.route_waypoints = HIGHWAY_WAYPOINTS
+        
+        # Event log
         self.event_log: List[str] = []
         self.max_log_size = 50
         
-        # Anti-bunching configuration (AGGRESSIVE)
-        self.TOTAL_DISTANCE = self._calculate_total_distance()  # Total route km
-        self.TARGET_HEADWAY = self.TOTAL_DISTANCE / 3  # Even spacing for 3 buses
-        self.BUNCHING_THRESHOLD = self.TARGET_HEADWAY * 0.3  # 30% of target ← AGGRESSIVE
-        self.RECOVERY_THRESHOLD = self.TARGET_HEADWAY * 0.6  # 60% of target
-        self.HOLDING_THRESHOLD = self.TARGET_HEADWAY * 0.4  # Trigger holding at 40%
-        
-        # Initialize buses at different stops with spacing
+        # Initialize buses on the route
         self.buses: Dict[str, Bus] = {}
         self._initialize_buses()
         
-        # Algorithm control
-        self.algorithm_enabled = True
+        self.last_dispatch_time = None  # Will be set on first tick
+        self.dispatch_interval = 15  # seconds between dispatching new buses
         
-        # Delayed bus tracking
-        self.delayed_bus_id: str = None
-    
-    def _calculate_total_distance(self) -> float:
-        """Calculate total route distance in km."""
-        total = 0.0
-        for i in range(len(self.STOPS) - 1):
-            s1, s2 = self.STOPS[i], self.STOPS[i+1]
-            total += self._haversine_distance(s1.latitude, s1.longitude, 
-                                             s2.latitude, s2.longitude)
-        # Add return distance
-        s_last = self.STOPS[-1]
-        s_first = self.STOPS[0]
-        total += self._haversine_distance(s_last.latitude, s_last.longitude,
-                                         s_first.latitude, s_first.longitude)
-        return total
-    
-    def _haversine_distance(self, lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-        """Calculate distance between two GPS points in km."""
-        R = 6371  # Earth radius in km
-        dlat = math.radians(lat2 - lat1)
-        dlon = math.radians(lon2 - lon1)
-        a = (math.sin(dlat/2) ** 2 + 
-             math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * 
-             math.sin(dlon/2) ** 2)
-        c = 2 * math.asin(math.sqrt(a))
-        return R * c
+        # Admin controls state
+        self.admin_mode_active = False
+        self.manual_stop_bus_id: str = None
     
     def _initialize_buses(self):
-        """Initialize 3 buses evenly distributed on route."""
-        spacing = self.TOTAL_DISTANCE / 3
-        for i, bus_id in enumerate(["bus_1", "bus_2", "bus_3"]):
-            stop_idx = i % len(self.STOPS)
-            stop = self.STOPS[stop_idx]
+        """Initialize all buses at the starting point in an idle state."""
+        colors = ["🔴", "🟡", "🟢", "🔵", "🟣"]
+        names = ["Express A", "Local B", "Rapid C", "City D", "Route E"]
+        start_waypoint = self.route_waypoints[0]
+        next_waypoint = self.route_waypoints[1]
+
+        for i in range(self.NUM_BUSES):
+            bus_id = f"bus_{i+1}"
             self.buses[bus_id] = Bus(
                 id=bus_id,
-                current_stop_idx=stop_idx,
-                progress_to_next=0.0,
-                latitude=stop.latitude,
-                longitude=stop.longitude,
-                status="moving",
-                speed_multiplier=1.0,
+                name=f"{colors[i]} {names[i]}",
+                latitude=start_waypoint[0],
+                longitude=start_waypoint[1],
+                destination_lat=next_waypoint[0],
+                destination_lon=next_waypoint[1],
+                status=BusStatus.IDLE, # Start as IDLE
+                speed=0,
+                heading=0.0,
+                alert_level="none",
+                closest_bus_id="",
+                closest_distance_km=999.0,
+                waypoint_index=0,
+                progress_on_segment=0.0
             )
-        self.add_event("✅ Simulation initialized with 3 buses at even spacing")
+        
+        self.add_event(f"✅ System initialized. All {self.NUM_BUSES} buses are idle at Tumkur.")
+    
+    def dispatch_bus(self):
+        """Find an idle bus and set it to moving."""
+        for bus in self.buses.values():
+            if bus.status == BusStatus.IDLE:
+                bus.status = BusStatus.MOVING
+                bus.speed = self.BASE_SPEED
+                self.add_event(f"🚌 {bus.name} dispatched from Tumkur, heading to Bangalore.")
+                return # Dispatch only one bus at a time
     
     def add_event(self, message: str):
         """Log an event with timestamp."""
@@ -146,112 +192,29 @@ class SimulationState:
             "buses": [
                 {
                     "id": bus.id,
-                    "latitude": bus.latitude,
-                    "longitude": bus.longitude,
-                    "current_stop_idx": bus.current_stop_idx,
-                    "progress_to_next": bus.progress_to_next,
+                    "name": bus.name,
+                    "latitude": round(bus.latitude, 6),
+                    "longitude": round(bus.longitude, 6),
+                    "destination_lat": round(bus.destination_lat, 6),
+                    "destination_lon": round(bus.destination_lon, 6),
                     "status": bus.status,
-                    "speed_multiplier": bus.speed_multiplier,
+                    "speed": round(bus.speed, 1),
+                    "heading": round(bus.heading, 1),
+                    "alert_level": bus.alert_level,
+                    "closest_bus_id": bus.closest_bus_id,
+                    "closest_distance_km": round(bus.closest_distance_km, 2),
+                    "alternative_routes": bus.alternative_routes,
                 }
                 for bus in self.buses.values()
             ],
-            "stops": [
-                {
-                    "id": stop.id,
-                    "name": stop.name,
-                    "latitude": stop.latitude,
-                    "longitude": stop.longitude,
-                }
-                for stop in self.STOPS
-            ],
-            "algorithm_enabled": self.algorithm_enabled,
-            "gaps": self._calculate_gaps(),
             "event_log": self.event_log,
-            "route_stats": {
-                "total_distance_km": round(self.TOTAL_DISTANCE, 2),
-                "target_headway_km": round(self.TARGET_HEADWAY, 2),
-                "bunching_threshold_km": round(self.BUNCHING_THRESHOLD, 2),
-            }
+            "config": {
+                "alert_warning_km": self.ALERT_WARNING,
+                "alert_critical_km": self.ALERT_CRITICAL,
+                "num_buses": self.NUM_BUSES,
+            },
+            "admin_mode": self.admin_mode_active,
         }
-    
-    def _calculate_gaps(self) -> Dict[str, float]:
-        """Calculate distances between consecutive buses in km."""
-        bus_list = sorted(self.buses.values(), key=lambda b: (b.current_stop_idx, b.progress_to_next))
-        gaps = {}
-        for i in range(len(bus_list)):
-            current_bus = bus_list[i]
-            next_bus = bus_list[(i + 1) % len(bus_list)]
-            gap = self._distance_between_buses(current_bus, next_bus)
-            gaps[f"{current_bus.id}_to_{next_bus.id}"] = round(gap, 2)
-        return gaps
-    
-    def _distance_between_buses(self, bus1: Bus, bus2: Bus) -> float:
-        """Calculate forward distance from bus1 to bus2 on the route."""
-        # Same stop or bus2 ahead on route
-        if bus1.current_stop_idx < bus2.current_stop_idx:
-            dist = 0.0
-            # Distance from bus1's current position to next stop
-            s_current = self.STOPS[bus1.current_stop_idx]
-            s_next = self.STOPS[bus1.current_stop_idx + 1]
-            seg_dist = self._haversine_distance(s_current.latitude, s_current.longitude,
-                                               s_next.latitude, s_next.longitude)
-            remaining_in_seg = seg_dist * (1 - bus1.progress_to_next)
-            dist += remaining_in_seg
-            
-            # Distance through all intermediate stops
-            for i in range(bus1.current_stop_idx + 1, bus2.current_stop_idx):
-                s1 = self.STOPS[i]
-                s2 = self.STOPS[i + 1]
-                dist += self._haversine_distance(s1.latitude, s1.longitude,
-                                                s2.latitude, s2.longitude)
-            
-            # Distance from bus2's previous stop to current position
-            if bus2.current_stop_idx > bus1.current_stop_idx + 1:
-                s_prev = self.STOPS[bus2.current_stop_idx - 1]
-                s_curr = self.STOPS[bus2.current_stop_idx]
-                seg_dist = self._haversine_distance(s_prev.latitude, s_prev.longitude,
-                                                   s_curr.latitude, s_curr.longitude)
-                dist += seg_dist * bus2.progress_to_next
-            else:
-                # Adjacent stops
-                s_prev = self.STOPS[bus1.current_stop_idx + 1]
-                s_curr = self.STOPS[bus2.current_stop_idx]
-                seg_dist = self._haversine_distance(s_prev.latitude, s_prev.longitude,
-                                                   s_curr.latitude, s_curr.longitude)
-                dist += seg_dist * bus2.progress_to_next
-            return dist
-        else:
-            # bus2 is behind bus1, calculate wrap-around distance
-            dist = 0.0
-            # From bus1 to end of route
-            for i in range(bus1.current_stop_idx, len(self.STOPS) - 1):
-                s1 = self.STOPS[i]
-                s2 = self.STOPS[i + 1]
-                seg_dist = self._haversine_distance(s1.latitude, s1.longitude,
-                                                   s2.latitude, s2.longitude)
-                if i == bus1.current_stop_idx:
-                    dist += seg_dist * (1 - bus1.progress_to_next)
-                else:
-                    dist += seg_dist
-            
-            # Wrap from last stop to first
-            s_last = self.STOPS[-1]
-            s_first = self.STOPS[0]
-            dist += self._haversine_distance(s_last.latitude, s_last.longitude,
-                                            s_first.latitude, s_first.longitude)
-            
-            # From start to bus2's position
-            for i in range(bus2.current_stop_idx):
-                s1 = self.STOPS[i]
-                s2 = self.STOPS[i + 1]
-                seg_dist = self._haversine_distance(s1.latitude, s1.longitude,
-                                                   s2.latitude, s2.longitude)
-                if i < bus2.current_stop_idx - 1:
-                    dist += seg_dist
-                else:
-                    dist += seg_dist * bus2.progress_to_next
-            
-            return dist
 
 
 # ============================================================================
@@ -259,173 +222,293 @@ class SimulationState:
 # ============================================================================
 
 class BusSimulation:
-    """Handles the physics and control logic for the bus system."""
+    """Handles bus movement and proximity detection logic."""
     
     def __init__(self, state: SimulationState):
         self.state = state
     
     def tick(self):
-        """
-        Execute one tick of the simulation (1 second).
-        Updates positions, handles stops, and applies AGGRESSIVE anti-bunching logic.
-        """
-        # Step 1: Apply PREVENTIVE anti-bunching (before movement)
-        if self.state.algorithm_enabled:
-            self._apply_preventive_holding()
-        
-        # Step 2: Update positions for buses not boarding/holding
+        """Execute one simulation tick (1 second)."""
+        current_time = asyncio.get_event_loop().time()
+
+        # Initialize dispatch time on the first tick
+        if self.state.last_dispatch_time is None:
+            self.state.last_dispatch_time = current_time
+
+        # Step 1: Dispatch new buses periodically
+        if current_time - self.state.last_dispatch_time > self.state.dispatch_interval:
+            self.state.dispatch_bus()
+            self.state.last_dispatch_time = current_time
+
+        # Step 2: Update bus positions
         self._update_positions()
         
-        # Step 3: Handle stop arrivals
-        self._handle_stop_arrivals()
+        # Step 3: Check for arrivals at destination
+        self._handle_arrivals()
         
-        # Step 4: Decrement boarding/holding counters
-        self._decrement_counters()
-        
-        # Step 5: Apply REACTIVE anti-bunching (after movement)
-        if self.state.algorithm_enabled:
-            self._apply_reactive_bunching()
+        # Step 4: Calculate proximity alerts
+        self._check_proximity_alerts()
     
     def _update_positions(self):
-        """
-        Update bus positions along the route.
-        Each bus moves based on speed from one stop to the next.
-        """
+        """Update each bus position towards its destination."""
         for bus in self.state.buses.values():
-            if bus.status == "moving":
-                current_stop = self.state.STOPS[bus.current_stop_idx]
-                next_stop_idx = (bus.current_stop_idx + 1) % len(self.state.STOPS)
-                next_stop = self.state.STOPS[next_stop_idx]
-                
-                # Distance to next stop
-                segment_distance = self.state._haversine_distance(
-                    current_stop.latitude, current_stop.longitude,
-                    next_stop.latitude, next_stop.longitude
-                )
-                
-                # Travel distance this tick (with speed multiplier)
-                travel_distance = (self.state.BASE_SPEED * bus.speed_multiplier) / 1000  # Convert to km
-                bus.progress_to_next += travel_distance / segment_distance
-                
-                # Check if reached next stop
-                if bus.progress_to_next >= 1.0:
-                    bus.current_stop_idx = next_stop_idx
-                    bus.progress_to_next = 0.0
-                
-                # Update GPS coordinates
-                lat_delta = (next_stop.latitude - current_stop.latitude) * bus.progress_to_next
-                lon_delta = (next_stop.longitude - current_stop.longitude) * bus.progress_to_next
-                bus.latitude = current_stop.latitude + lat_delta
-                bus.longitude = current_stop.longitude + lon_delta
-    
-    def _handle_stop_arrivals(self):
-        """Check if any bus has arrived at a stop."""
-        for bus in self.state.buses.values():
-            if bus.status == "moving" and bus.progress_to_next < 0.01:  # Just arrived
-                stop = self.state.STOPS[bus.current_stop_idx]
-                bus.status = "boarding"
-                bus.boarding_counter = self.state.BOARDING_DURATION
-                self.state.add_event(f"🚌 {bus.id} → {stop.name}")
-    
-    def _decrement_counters(self):
-        """Decrement boarding and holding counters."""
-        for bus in self.state.buses.values():
-            if bus.status == "boarding":
-                bus.boarding_counter -= 1
-                if bus.boarding_counter <= 0:
-                    bus.status = "moving"
-                    bus.boarding_counter = 0
+            if bus.status != BusStatus.MOVING:
+                continue
+
+            current_loc = bus.current_location()
+            destination_loc = bus.destination_location()
+            distance_to_dest = current_loc.distance_to(destination_loc)
+
+            # If bus is very close to its destination waypoint, mark for arrival
+            if distance_to_dest < 0.1:  # Less than 100 meters
+                bus.status = BusStatus.BOARDING
+                # Snap to destination to avoid overshooting
+                bus.latitude = bus.destination_lat
+                bus.longitude = bus.destination_lon
+                continue
+
+            # Movement for this tick (in km)
+            movement_km = (bus.speed / 3600) * self.state.TICK_INTERVAL
             
-            elif bus.status == "holding":
-                bus.holding_counter -= 1
-                if bus.holding_counter <= 0:
-                    bus.status = "moving"
-                    bus.holding_counter = 0
-                    gap = self.state._calculate_gaps()
-                    gap_key = list(gap.keys())[0]  # Just for display
-                    self.state.add_event(f"✅ {bus.id} resuming (spacing recovered)")
+            # Interpolate position
+            fraction_of_travel = movement_km / distance_to_dest
+            
+            bus.latitude += (bus.destination_lat - bus.latitude) * fraction_of_travel
+            bus.longitude += (bus.destination_lon - bus.longitude) * fraction_of_travel
+
+            # Calculate heading
+            dlat = bus.destination_lat - bus.latitude
+            dlon = bus.destination_lon - bus.longitude
+            bus.heading = (math.degrees(math.atan2(dlon, dlat)) + 360) % 360
+
+    def _handle_arrivals(self):
+        """Handle buses that have arrived at a waypoint and assign the next one."""
+        final_destination = Location(12.9716, 77.5946)  # Bangalore endpoint
+        
+        for bus in self.state.buses.values():
+            if bus.status == BusStatus.BOARDING:
+                current_loc = bus.current_location()
+                
+                # Check if bus is very close to final destination
+                if current_loc.distance_to(final_destination) < 0.5:  # Within 500m of Bangalore
+                    self.state.add_event(f"✅ {bus.name} reached final destination in Bangalore!")
+                    bus.status = BusStatus.IDLE
+                    bus.speed = 0
+                    bus.latitude = final_destination.latitude
+                    bus.longitude = final_destination.longitude
+                    bus.current_route = None
+                    continue
+                
+                # If bus has a custom route, follow it
+                if bus.current_route and len(bus.current_route) > 0:
+                    bus.waypoint_index = (bus.waypoint_index + 1) % len(bus.current_route)
+                    
+                    # Check if reached end of custom route
+                    if bus.waypoint_index == 0:
+                        # Go to final destination
+                        bus.destination_lat = final_destination.latitude
+                        bus.destination_lon = final_destination.longitude
+                        bus.current_route = None
+                        bus.status = BusStatus.MOVING
+                        self.state.add_event(f"📍 {bus.name} exiting divert route, heading to Bangalore")
+                    else:
+                        # Go to next waypoint on custom route
+                        waypoint = bus.current_route[bus.waypoint_index]
+                        bus.destination_lat = waypoint[0]
+                        bus.destination_lon = waypoint[1]
+                        bus.status = BusStatus.MOVING
+                    continue
+                
+                # Follow normal highway route
+                bus.waypoint_index = (bus.waypoint_index + 1) % len(self.state.route_waypoints)
+                
+                # If it's the last waypoint, head to final destination
+                if bus.waypoint_index == 0:
+                    self.state.add_event(f"🚌 {bus.name} reached end of route, heading to Bangalore.")
+                    bus.destination_lat = final_destination.latitude
+                    bus.destination_lon = final_destination.longitude
+                    bus.status = BusStatus.MOVING
+                    bus.speed = self.state.BASE_SPEED
+                    continue
+                
+                # Set new destination
+                dest_waypoint = self.state.route_waypoints[bus.waypoint_index]
+                bus.destination_lat = dest_waypoint[0]
+                bus.destination_lon = dest_waypoint[1]
+                
+                bus.status = BusStatus.MOVING
+                bus.speed = self.state.BASE_SPEED
+                
+                self.state.add_event(f"📍 {bus.name} continuing to next waypoint.")
     
-    def _apply_preventive_holding(self):
-        """
-        AGGRESSIVE: Prevent bunching BEFORE it happens.
-        If next bus is too close, hold current bus at stop.
-        """
-        bus_list = sorted(self.state.buses.values(), 
-                         key=lambda b: (b.current_stop_idx, b.progress_to_next))
-        gaps = self.state._calculate_gaps()
+    def _check_proximity_alerts(self):
+        """Check distance between all buses and trigger alerts."""
+        bus_list = list(self.state.buses.values())
         
         for i, bus in enumerate(bus_list):
-            # Get the next bus ahead
-            next_bus = bus_list[(i - 1) % len(bus_list)]
+            min_distance = 999.0
+            closest_bus_id = ""
+            alert_level = "none"
             
-            # Find gap TO this bus (how far behind next_bus we are)
-            prev_bus = bus_list[(i + 1) % len(bus_list)]
-            gap_key = f"{prev_bus.id}_to_{bus.id}"
-            if gap_key not in gaps:
-                gap_key = f"{bus.id}_to_{next_bus.id}"
-            gap = gaps.get(gap_key, self.state.TARGET_HEADWAY)
+            # Find closest bus
+            for other_bus in bus_list:
+                if other_bus.id != bus.id:
+                    distance = bus.current_location().distance_to(other_bus.current_location())
+                    
+                    if distance < min_distance:
+                        min_distance = distance
+                        closest_bus_id = other_bus.id
             
-            # AGGRESSIVE HOLDING: If gap to bus ahead is below threshold, hold
-            if (bus.status == "boarding" and 
-                gap < self.state.HOLDING_THRESHOLD and
-                bus.holding_counter == 0):
-                bus.status = "holding"
-                bus.holding_counter = 20  # Hold for 20 seconds
-                stop = self.state.STOPS[bus.current_stop_idx]
-                self.state.add_event(
-                    f"🛑 {bus.id} holding at {stop.name} "
-                    f"(preventing bunching, gap: {gap:.2f}km)"
-                )
-    
-    def _apply_reactive_bunching(self):
-        """
-        REACTIVE: If bunching still occurs, fix it immediately.
-        """
-        gaps = self.state._calculate_gaps()
-        bus_list = sorted(self.state.buses.values(), 
-                         key=lambda b: (b.current_stop_idx, b.progress_to_next))
-        
-        for i, bus in enumerate(bus_list):
-            next_bus = bus_list[(i + 1) % len(bus_list)]
-            gap_key = f"{bus.id}_to_{next_bus.id}"
-            gap = gaps.get(gap_key, self.state.TARGET_HEADWAY)
+            # Determine alert level
+            if min_distance < self.state.ALERT_CRITICAL:
+                alert_level = "critical"
+            elif min_distance < self.state.ALERT_WARNING:
+                alert_level = "warning"
+            else:
+                alert_level = "none"
             
-            # EMERGENCY: If bunching detected, suppress bus movement
-            if gap < self.state.BUNCHING_THRESHOLD:
-                if bus.status == "moving":
-                    bus.status = "holding"
-                    bus.holding_counter = 30
+            # Update bus state
+            bus.closest_distance_km = min_distance
+            bus.closest_bus_id = closest_bus_id
+            
+            # Only update if alert level changed
+            if alert_level != bus.alert_level:
+                bus.alert_level = alert_level
+                
+                if alert_level == "critical":
                     self.state.add_event(
-                        f"🚨 EMERGENCY HOLD {bus.id} - bunching detected! "
-                        f"(gap: {gap:.2f}km, threshold: {self.state.BUNCHING_THRESHOLD:.2f}km)"
+                        f"🚨 CRITICAL: {bus.name} is {min_distance:.1f} km from {closest_bus_id}!"
                     )
-            
-            # Release holding when gap is fully recovered
-            elif (bus.status == "holding" and 
-                  gap >= self.state.RECOVERY_THRESHOLD):
-                bus.status = "moving"
-                bus.holding_counter = 0
+                elif alert_level == "warning":
+                    self.state.add_event(
+                        f"⚠️ WARNING: {bus.name} is {min_distance:.1f} km from {closest_bus_id}"
+                    )
     
-    def inject_traffic_delay(self, bus_id: str, duration_ticks: int = 15):
-        """
-        Inject mild traffic delay (less severe than before).
-        Robust algorithm should handle it.
-        """
+    def slow_down_bus(self, bus_id: str):
+        """Admin: Slow down a specific bus."""
         if bus_id in self.state.buses:
             bus = self.state.buses[bus_id]
-            bus.speed_multiplier = 0.6  # Only 40% reduction (was 60%)
-            self.state.delayed_bus_id = bus_id
-            self.state.add_event(
-                f"🚦 Slight traffic on {bus_id} (speed 0.6x for {duration_ticks}s)"
-            )
-            asyncio.create_task(self._recover_from_delay(bus_id, duration_ticks))
+            bus.speed = max(10, bus.speed * 0.7)  # Reduce by 30%, min 10 km/h
+            self.state.add_event(f"🚦 {bus.name} slowed to {bus.speed:.1f} km/h")
     
-    async def _recover_from_delay(self, bus_id: str, duration_ticks: int):
-        """Recover from delay."""
-        await asyncio.sleep(duration_ticks)
-        if bus_id in self.state.buses and self.state.buses[bus_id].speed_multiplier == 0.6:
-            self.state.buses[bus_id].speed_multiplier = 1.0
-            self.state.add_event(f"✅ Traffic cleared, {bus_id} back to normal")
+    def speed_up_bus(self, bus_id: str):
+        """Admin: Speed up a specific bus."""
+        if bus_id in self.state.buses:
+            bus = self.state.buses[bus_id]
+            bus.speed = min(80, bus.speed * 1.3)  # Increase by 30%, max 80 km/h
+            self.state.add_event(f"⚡ {bus.name} speeded to {bus.speed:.1f} km/h")
+    
+    def stop_bus(self, bus_id: str):
+        """Admin: Stop a bus."""
+        if bus_id in self.state.buses:
+            bus = self.state.buses[bus_id]
+            if bus.status != BusStatus.STOPPED:
+                bus.status = BusStatus.STOPPED
+                bus.speed = 0
+                self.state.add_event(f"⏹️ {bus.name} stopped by admin")
+    
+    def resume_bus(self, bus_id: str):
+        """Admin: Resume a stopped bus."""
+        if bus_id in self.state.buses:
+            bus = self.state.buses[bus_id]
+            if bus.status == BusStatus.STOPPED:
+                bus.status = BusStatus.MOVING
+                bus.speed = self.state.BASE_SPEED
+                self.state.add_event(f"▶️ {bus.name} resumed by admin")
+    
+    def divert_bus(self, bus_id: str):
+        """Admin: Generate alternative routes for a bus to the same destination."""
+        if bus_id in self.state.buses:
+            bus = self.state.buses[bus_id]
+            
+            # Always clear old routes first
+            bus.alternative_routes = None
+            bus.current_route = None
+            
+            # Generate 3 alternative routes with different offset amounts
+            current_loc = Location(bus.latitude, bus.longitude)
+            destination_loc = Location(12.9716, 77.5946)  # Bangalore
+            
+            routes = []
+            
+            # Route 1: Slight left deviation
+            route1 = self._generate_diverted_route(current_loc, destination_loc, offset=0.02, direction=1)
+            routes.append(route1)
+            
+            # Route 2: Slight right deviation  
+            route2 = self._generate_diverted_route(current_loc, destination_loc, offset=0.02, direction=-1)
+            routes.append(route2)
+            
+            # Route 3: Large detour left
+            route3 = self._generate_diverted_route(current_loc, destination_loc, offset=0.04, direction=1)
+            routes.append(route3)
+            
+            # Store routes on the bus
+            bus.alternative_routes = routes
+            
+            self.state.add_event(f"🔄 {bus.name}: Divert options generated. Select a route.")
+    
+    def _generate_diverted_route(self, start: Location, end: Location, offset: float, direction: int) -> list:
+        """Generate a diverted route with waypoint deviations."""
+        # Create intermediate points with offset
+        route = [
+            [start.latitude, start.longitude]
+        ]
+        
+        # Number of segments for the detour
+        segments = 3
+        
+        for i in range(1, segments + 1):
+            # Interpolate position along the direct path
+            t = i / (segments + 1)
+            lat = start.latitude + (end.latitude - start.latitude) * t
+            lon = start.longitude + (end.longitude - start.longitude) * t
+            
+            # Add offset perpendicular to the route
+            offset_lat = offset * direction * (1 - abs(2*t - 1))  # Peak offset at midpoint
+            offset_lon = offset * direction * 0.5 * (1 - abs(2*t - 1))
+            
+            route.append([lat + offset_lat, lon + offset_lon])
+        
+        # Add destination
+        route.append([end.latitude, end.longitude])
+        
+        return route
+    
+    def select_route(self, bus_id: str, route_index: int):
+        """Admin: Select an alternative route for the bus to follow."""
+        if bus_id in self.state.buses:
+            bus = self.state.buses[bus_id]
+            
+            if bus.alternative_routes and 0 <= route_index < len(bus.alternative_routes):
+                selected_route = bus.alternative_routes[route_index]
+                
+                # Store the custom route
+                bus.current_route = selected_route
+                
+                # Move bus to the start of the custom route
+                start_waypoint = selected_route[0]
+                bus.latitude = start_waypoint[0]
+                bus.longitude = start_waypoint[1]
+                bus.waypoint_index = 0
+                
+                # Set destination to first waypoint on the route
+                if len(selected_route) > 1:
+                    first_waypoint = selected_route[1]
+                    bus.destination_lat = first_waypoint[0]
+                    bus.destination_lon = first_waypoint[1]
+                    bus.status = BusStatus.MOVING
+                    bus.speed = self.state.BASE_SPEED
+                    
+                    self.state.add_event(f"🗺️ {bus.name} now following diverted route {route_index + 1}")
+                
+                # Clear alternative routes since one is selected
+                bus.alternative_routes = None
+    
+    def reset_system(self):
+        """Admin: Reset all buses to initial state."""
+        self.state._initialize_buses()
+        self.state.add_event("🔄 System reset - all buses reinitialized at start position")
 
 
 # ============================================================================
@@ -499,7 +582,7 @@ async def lifespan(app: FastAPI):
 
 
 # Create FastAPI app with CORS and lifespan
-app = FastAPI(title="Bus Bunching Control System", lifespan=lifespan)
+app = FastAPI(title="Bus Tracking & Alert System - Tumkur to Bangalore", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -516,73 +599,57 @@ app.add_middleware(
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    """
-    WebSocket endpoint for bidirectional communication with frontend.
-    Clients connect here and receive continuous state updates.
-    """
+    """WebSocket endpoint for real-time communication."""
     await websocket.accept()
     active_connections.add(websocket)
     
-    sim_state.add_event(f"Client connected. Connected clients: {len(active_connections)}")
+    sim_state.add_event(f"🟢 Client connected")
     
     try:
-        # Send initial state
         await websocket.send_text(json.dumps(sim_state.get_state()))
         
-        # Listen for incoming messages from client
         while True:
             data = await websocket.receive_text()
             message = json.loads(data)
             
-            # Handle incoming commands
-            if message.get("type") == "toggle_algorithm":
-                sim_state.algorithm_enabled = not sim_state.algorithm_enabled
-                status = "enabled" if sim_state.algorithm_enabled else "disabled"
-                sim_state.add_event(f"Anti-bunching algorithm {status}")
+            cmd_type = message.get("type")
             
-            elif message.get("type") == "inject_delay":
-                bus_id = message.get("bus_id", "bus_1")
-                simulation.inject_traffic_delay(bus_id)
-            
-            elif message.get("type") == "move_bus":
+            if cmd_type == "slow_down":
                 bus_id = message.get("bus_id")
-                if bus_id in sim_state.buses:
-                    bus = sim_state.buses[bus_id]
-                    bus.status = "moving"
-                    bus.speed_multiplier = 1.0
-                    sim_state.add_event(f"✅ {bus_id} resumed movement")
+                simulation.slow_down_bus(bus_id)
             
-            elif message.get("type") == "stop_bus":
+            elif cmd_type == "speed_up":
                 bus_id = message.get("bus_id")
-                if bus_id in sim_state.buses:
-                    bus = sim_state.buses[bus_id]
-                    bus.status = "holding"
-                    bus.holding_counter = 100
-                    sim_state.add_event(f"🛑 {bus_id} stopped manually")
+                simulation.speed_up_bus(bus_id)
             
-            elif message.get("type") == "reset":
-                # Reset simulation to initial state
-                # Re-space buses evenly at different stops
-                spacing = sim_state.TOTAL_DISTANCE / 3
-                for i, bus_id in enumerate(["bus_1", "bus_2", "bus_3"]):
-                    if bus_id in sim_state.buses:
-                        bus = sim_state.buses[bus_id]
-                        # Place at different stops
-                        stop_idx = i % len(sim_state.STOPS)
-                        stop = sim_state.STOPS[stop_idx]
-                        bus.current_stop_idx = stop_idx
-                        bus.progress_to_next = 0.0
-                        bus.latitude = stop.latitude
-                        bus.longitude = stop.longitude
-                        bus.status = "moving"
-                        bus.speed_multiplier = 1.0
-                        bus.boarding_counter = 0
-                        bus.holding_counter = 0
-                sim_state.add_event("🔄 Simulation reset")
+            elif cmd_type == "stop":
+                bus_id = message.get("bus_id")
+                simulation.stop_bus(bus_id)
+            
+            elif cmd_type == "resume":
+                bus_id = message.get("bus_id")
+                simulation.resume_bus(bus_id)
+            
+            elif cmd_type == "divert":
+                bus_id = message.get("bus_id")
+                simulation.divert_bus(bus_id)
+            
+            elif cmd_type == "select_route":
+                bus_id = message.get("bus_id")
+                route_index = message.get("route_index")
+                simulation.select_route(bus_id, route_index)
+            
+            elif cmd_type == "reset":
+                simulation.reset_system()
+            
+            elif cmd_type == "toggle_admin":
+                sim_state.admin_mode_active = not sim_state.admin_mode_active
+                status = "enabled" if sim_state.admin_mode_active else "disabled"
+                sim_state.add_event(f"👨‍💼 Admin mode {status}")
     
     except WebSocketDisconnect:
         active_connections.discard(websocket)
-        sim_state.add_event(f"Client disconnected. Connected clients: {len(active_connections)}")
+        sim_state.add_event(f"🔴 Client disconnected")
     except Exception as e:
         print(f"WebSocket error: {e}")
         active_connections.discard(websocket)
@@ -595,39 +662,12 @@ async def websocket_endpoint(websocket: WebSocket):
 @app.get("/")
 def root():
     """Health check endpoint."""
-    return {"status": "ok", "service": "Bus Bunching Control System"}
-
+    return {"status": "ok", "service": "Bus Tracking - Tumkur to Bangalore"}
 
 @app.get("/state")
 def get_state():
-    """Get current simulation state via HTTP (fallback to WebSocket for real-time)."""
+    """Get current simulation state."""
     return sim_state.get_state()
-
-
-@app.post("/algorithm/toggle")
-def toggle_algorithm():
-    """Toggle anti-bunching algorithm on/off."""
-    sim_state.algorithm_enabled = not sim_state.algorithm_enabled
-    status = "enabled" if sim_state.algorithm_enabled else "disabled"
-    sim_state.add_event(f"Anti-bunching algorithm {status} (via REST)")
-    return {"algorithm_enabled": sim_state.algorithm_enabled}
-
-
-@app.post("/inject-delay/{bus_id}")
-def inject_delay(bus_id: str):
-    """Inject traffic delay on a specific bus."""
-    if bus_id not in sim_state.buses:
-        return {"error": f"Bus {bus_id} not found"}
-    simulation.inject_traffic_delay(bus_id, duration_ticks=15)
-    return {"status": "delay injected", "bus_id": bus_id}
-
-
-@app.post("/reset")
-def reset_simulation():
-    """Reset simulation to initial state."""
-    sim_state.__init__()  # Reinitialize
-    sim_state.add_event("✅ Simulation reset to initial state")
-    return {"status": "reset"}
 
 
 if __name__ == "__main__":

@@ -3,38 +3,59 @@ import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
 
 /**
- * Bus Bunching Control System - React Frontend (v2.0)
- * OpenStreetMap visualization of bus positions and anti-bunching control
+ * Bus Tracking & Alert System - React Frontend
+ * Tumkur to Bangalore highway route tracking with proximity alerts
+ * Uses Stadia Maps for road visibility in India
  */
 
-const BusBunchingApp = () => {
-  // =========================================================================
-  // STATE MANAGEMENT
-  // =========================================================================
+// Route waypoints from Tumkur to Bangalore (NH48 Highway)
+const HIGHWAY_WAYPOINTS = [
+  [13.3426, 77.1023], // Tumkur (start)
+  [13.3300, 77.1200],
+  [13.3150, 77.1450],
+  [13.2980, 77.1700],
+  [13.2800, 77.1950],
+  [13.2600, 77.2200],
+  [13.2350, 77.2450],
+  [13.2100, 77.2700],
+  [13.1850, 77.2950],
+  [13.1600, 77.3200],
+  [13.1350, 77.3450],
+  [13.1100, 77.3700],
+  [13.0900, 77.3950],
+  [13.0700, 77.4200],
+  [13.0500, 77.4450],
+  [13.0300, 77.4700],
+  [13.0100, 77.4950],
+  [12.9950, 77.5200],
+  [12.9800, 77.5450],
+  [12.9716, 77.5946], // Bangalore (end)
+];
 
+const BusTrackingApp = () => {
   const [buses, setBuses] = useState([]);
-  const [stops, setStops] = useState([]);
-  const [gaps, setGaps] = useState({});
   const [eventLog, setEventLog] = useState([]);
-  const [algorithmEnabled, setAlgorithmEnabled] = useState(true);
+  const [config, setConfig] = useState({
+    alert_critical_km: 5,
+    alert_warning_km: 10
+  });
   const [connected, setConnected] = useState(false);
-  const [delayedBus, setDelayedBus] = useState(null);
-  const [mapInitialized, setMapInitialized] = useState(false);
-  
+  const [adminMode, setAdminMode] = useState(false);
+  const [selectedBus, setSelectedBus] = useState(null);
+  const [divertBusId, setDivertBusId] = useState(null);  // Bus with divert options
+  const [divertRoutes, setDivertRoutes] = useState([]);  // Alternative routes for divert
+
   const wsRef = useRef(null);
-  const reconnectTimeoutRef = useRef(null);
-  const logEndRef = useRef(null);
   const mapRef = useRef(null);
   const busMarkersRef = useRef({});
-  const stopMarkersRef = useRef({});
+  const routePolylinesRef = useRef({});  // Store route polylines
+  const logEndRef = useRef(null);
 
   // =========================================================================
-  // WEBSOCKET CONNECTION & RECONNECTION LOGIC
+  // WEBSOCKET CONNECTION
   // =========================================================================
 
   const connectWebSocket = useCallback(() => {
-    if (wsRef.current) return; // Already connected
-
     try {
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const wsUrl = `${protocol}//${window.location.hostname}:8000/ws`;
@@ -42,423 +63,453 @@ const BusBunchingApp = () => {
       const ws = new WebSocket(wsUrl);
 
       ws.onopen = () => {
-        console.log('WebSocket connected');
+        console.log('🟢 WebSocket connected');
         setConnected(true);
-        if (reconnectTimeoutRef.current) {
-          clearTimeout(reconnectTimeoutRef.current);
-          reconnectTimeoutRef.current = null;
-        }
       };
 
       ws.onmessage = (event) => {
-        try {
-          const data = JSON.parse(event.data);
-          if (data.buses) setBuses(data.buses);
-          if (data.stops) setStops(data.stops);
-          if (data.gaps) setGaps(data.gaps);
-          if (data.event_log) setEventLog(data.event_log);
-          if (data.algorithm_enabled !== undefined) {
-            setAlgorithmEnabled(data.algorithm_enabled);
-          }
-        } catch (err) {
-          console.error('Error parsing WebSocket message:', err);
+        const data = JSON.parse(event.data);
+        setBuses(data.buses || []);
+        setEventLog(data.event_log || []);
+        setConfig(data.config || { alert_critical_km: 5, alert_warning_km: 10 });
+        setAdminMode(data.admin_mode || false);
+
+        // Check if any bus has alternative routes (divert options)
+        const busWithRoutes = data.buses?.find(b => b.alternative_routes && b.alternative_routes.length > 0);
+        if (busWithRoutes) {
+          setDivertBusId(busWithRoutes.id);
+          setDivertRoutes(busWithRoutes.alternative_routes);
         }
       };
 
       ws.onerror = (error) => {
         console.error('WebSocket error:', error);
+        setConnected(false);
       };
 
       ws.onclose = () => {
-        console.log('WebSocket disconnected');
+        console.log('🔴 WebSocket disconnected');
         setConnected(false);
-        wsRef.current = null;
-        // Attempt to reconnect after 3 seconds
-        reconnectTimeoutRef.current = setTimeout(connectWebSocket, 3000);
+        setTimeout(connectWebSocket, 3000);
       };
 
       wsRef.current = ws;
-    } catch (err) {
-      console.error('Failed to connect WebSocket:', err);
-      setConnected(false);
+    } catch (error) {
+      console.error('Failed to connect WebSocket:', error);
+      setTimeout(connectWebSocket, 3000);
     }
   }, []);
 
   // =========================================================================
-  // MAP INITIALIZATION
+  // SEND COMMAND TO BACKEND
+  // =========================================================================
+
+  const sendCommand = (command) => {
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify(command));
+    }
+  };
+
+  // =========================================================================
+  // ADMIN CONTROLS
+  // =========================================================================
+
+  const slowDown = (busId) => {
+    sendCommand({ type: 'slow_down', bus_id: busId });
+  };
+
+  const speedUp = (busId) => {
+    sendCommand({ type: 'speed_up', bus_id: busId });
+  };
+
+  const stopBus = (busId) => {
+    sendCommand({ type: 'stop', bus_id: busId });
+  };
+
+  const resumeBus = (busId) => {
+    sendCommand({ type: 'resume', bus_id: busId });
+  };
+
+  const divertBus = (busId) => {
+    // Always generate fresh routes when divert is clicked
+    sendCommand({ type: 'divert', bus_id: busId });
+  };
+
+  const selectDivertRoute = (routeIndex) => {
+    if (divertBusId) {
+      sendCommand({ type: 'select_route', bus_id: divertBusId, route_index: routeIndex });
+      setDivertBusId(null);
+      setDivertRoutes([]);
+      // Clear route polylines from map
+      Object.values(routePolylinesRef.current).forEach(polyline => {
+        if (mapRef.current) mapRef.current.removeLayer(polyline);
+      });
+      routePolylinesRef.current = {};
+    }
+  };
+
+  const resetSystem = () => {
+    sendCommand({ type: 'reset' });
+  };
+
+  const toggleAdminMode = () => {
+    sendCommand({ type: 'toggle_admin' });
+  };
+
+  // =========================================================================
+  // MAP INITIALIZATION & UPDATES
   // =========================================================================
 
   useEffect(() => {
-    console.log('MAP INIT CHECK:', { mapInitialized, stopsLength: stops.length, L: typeof L });
-    
-    if (!mapInitialized && stops.length > 0) {
-      try {
-        const mapContainer = document.getElementById('map');
-        console.log('Map container:', mapContainer);
-        
-        // Create map
-        if (mapRef.current === null) {
-          console.log('Creating new Leaflet map...');
-          const map = L.map('map', {
-            center: [40.7450, -73.9990],
-            zoom: 13,
-            zoomControl: true,
-            scrollWheelZoom: true
-          });
+    if (!mapRef.current) {
+      // Center on Bangalore/Tumkur region in India
+      const defaultCenter = [13.15, 77.35];
+      const map = L.map('map').setView(defaultCenter, 10);
 
-          L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-            attribution: '© OpenStreetMap contributors',
-            maxZoom: 19
-          }).addTo(map);
+      L.tileLayer('https://tiles.stadiamaps.com/tiles/osm_bright/{z}/{x}/{y}.png', {
+        attribution: '&copy; Stadia Maps, &copy; OpenStreetMap',
+        maxZoom: 18,
+        minZoom: 5,
+      }).addTo(map);
 
-          mapRef.current = map;
-          console.log('Leaflet map created:', map);
-        }
+      // Draw the route as a blue polyline
+      L.polyline(HIGHWAY_WAYPOINTS, {
+        color: 'blue',
+        weight: 3,
+        opacity: 0.7,
+        dashArray: '5, 5',
+        lineJoin: 'round'
+      }).addTo(map);
 
-        const map = mapRef.current;
+      // Add markers for start and end points
+      L.circleMarker([13.3426, 77.1023], {
+        radius: 10,
+        fillColor: 'green',
+        color: '#000',
+        weight: 2,
+        opacity: 1,
+        fillOpacity: 0.9
+      }).bindPopup('📍 Tumkur (Start)').addTo(map);
 
-        // Add stop markers
-        stops.forEach((stop) => {
-          if (!stopMarkersRef.current[stop.id]) {
-            console.log('Adding stop marker:', stop.id, stop.latitude, stop.longitude);
-            const marker = L.circleMarker(
-              [stop.latitude, stop.longitude],
-              {
-                radius: 8,
-                fillColor: 'white',
-                color: '#64748b',
-                weight: 2,
-                opacity: 1,
-                fillOpacity: 0.8
-              }
-            ).addTo(map);
+      L.circleMarker([12.9716, 77.5946], {
+        radius: 10,
+        fillColor: 'red',
+        color: '#000',
+        weight: 2,
+        opacity: 1,
+        fillOpacity: 0.9
+      }).bindPopup('📍 Bangalore (End)').addTo(map);
 
-            marker.bindPopup(`<strong>${stop.name}</strong><br>Stop: ${stop.id}`);
-            stopMarkersRef.current[stop.id] = marker;
-          }
-        });
-
-        // Fit bounds to show all stops
-        if (stops.length > 0) {
-          const bounds = L.latLngBounds(stops.map(s => [s.latitude, s.longitude]));
-          map.fitBounds(bounds, { padding: [50, 50] });
-        }
-
-        setMapInitialized(true);
-        console.log('Map initialized successfully');
-      } catch (err) {
-        console.error('Error initializing map:', err);
-      }
+      mapRef.current = map;
     }
-  }, [stops, mapInitialized]);
-
-  // =========================================================================
-  // UPDATE BUS MARKERS
-  // =========================================================================
+  }, []);
 
   useEffect(() => {
     if (!mapRef.current) return;
 
-    const map = mapRef.current;
+    // Clear existing route polylines
+    Object.values(routePolylinesRef.current).forEach(polyline => {
+      if (mapRef.current) mapRef.current.removeLayer(polyline);
+    });
+    routePolylinesRef.current = {};
+
+    // Draw alternative routes for buses with divert options
+    buses.forEach((bus) => {
+      if (bus.alternative_routes && bus.alternative_routes.length > 0) {
+        bus.alternative_routes.forEach((route, routeIdx) => {
+          const polylineKey = `${bus.id}-route-${routeIdx}`;
+          const polyline = L.polyline(route, {
+            color: '#00FFFF',  // Cyan for alternative routes
+            weight: 2,
+            opacity: 0.6,
+            dashArray: '5, 5',
+            lineJoin: 'round'
+          }).addTo(mapRef.current);
+          
+          routePolylinesRef.current[polylineKey] = polyline;
+        });
+      }
+    });
 
     buses.forEach((bus) => {
-      if (!busMarkersRef.current[bus.id]) {
-        const color = getBusColor(bus.id);
-        const marker = L.circleMarker(
-          [bus.latitude, bus.longitude],
-          {
-            radius: 10,
-            fillColor: color,
-            color: '#ffffff',
-            weight: 2,
-            opacity: 1,
-            fillOpacity: 0.8
-          }
-        ).addTo(map);
+      const markerId = bus.id;
+      const latLng = L.latLng(bus.latitude, bus.longitude);
 
-        marker.bindPopup(`<strong>${bus.id}</strong><br>Status: ${bus.status}`);
-        busMarkersRef.current[bus.id] = marker;
+      if (busMarkersRef.current[markerId]) {
+        busMarkersRef.current[markerId].setLatLng(latLng);
       } else {
-        // Update existing marker position
-        busMarkersRef.current[bus.id].setLatLng([bus.latitude, bus.longitude]);
-        busMarkersRef.current[bus.id].setPopupContent(
-          `<strong>${bus.id}</strong><br>Status: ${bus.status}`
-        );
+        // Determine color based on status and speed
+        let color = 'blue';
+        if (bus.status === 'stopped') {
+          color = '#FF6B6B'; // Red for stopped
+        } else if (bus.status === 'idle') {
+          color = '#808080'; // Gray for idle
+        } else if (bus.alert_level === 'critical') {
+          color = '#FF0000'; // Bright red for critical proximity
+        } else if (bus.alert_level === 'warning') {
+          color = '#FFA500'; // Orange for warning proximity
+        } else if (bus.speed < 50) {
+          color = '#FFD700'; // Yellow for slow moving
+        } else if (bus.speed > 150) {
+          color = '#00FF00'; // Green for fast moving
+        } else {
+          color = '#1E90FF'; // Blue for normal moving
+        }
+        
+        const marker = L.circleMarker(latLng, {
+          radius: 8,
+          fillColor: color,
+          color: '#000',
+          weight: 2,
+          opacity: 1,
+          fillOpacity: 0.8,
+        })
+          .bindPopup(`<b>${bus.name}</b><br/>Speed: ${bus.speed.toFixed(1)} km/h<br/>Status: ${bus.status}`)
+          .addTo(mapRef.current);
+
+        busMarkersRef.current[markerId] = marker;
+      }
+
+      // Update color based on current status and speed
+      let color = 'blue';
+      if (bus.status === 'stopped') {
+        color = '#FF6B6B'; // Red for stopped
+      } else if (bus.status === 'idle') {
+        color = '#808080'; // Gray for idle
+      } else if (bus.alert_level === 'critical') {
+        color = '#FF0000'; // Bright red for critical proximity
+      } else if (bus.alert_level === 'warning') {
+        color = '#FFA500'; // Orange for warning proximity
+      } else if (bus.speed < 50) {
+        color = '#FFD700'; // Yellow for slow moving
+      } else if (bus.speed > 150) {
+        color = '#00FF00'; // Green for fast moving
+      } else {
+        color = '#1E90FF'; // Blue for normal moving
+      }
+      busMarkersRef.current[markerId].setStyle({ fillColor: color });
+    });
+
+    Object.keys(busMarkersRef.current).forEach((markerId) => {
+      if (!buses.find((bus) => bus.id === markerId)) {
+        mapRef.current.removeLayer(busMarkersRef.current[markerId]);
+        delete busMarkersRef.current[markerId];
       }
     });
   }, [buses]);
-
-  // =========================================================================
-  // LIFECYCLE HOOKS
-  // =========================================================================
-
-  useEffect(() => {
-    connectWebSocket();
-
-    return () => {
-      if (wsRef.current) {
-        wsRef.current.close();
-        wsRef.current = null;
-      }
-      if (reconnectTimeoutRef.current) {
-        clearTimeout(reconnectTimeoutRef.current);
-      }
-    };
-  }, [connectWebSocket]);
 
   useEffect(() => {
     logEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [eventLog]);
 
-  // =========================================================================
-  // CONTROL HANDLERS
-  // =========================================================================
-
-  const sendCommand = (command) => {
-    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
-      console.error('WebSocket not connected');
-      return;
-    }
-    wsRef.current.send(JSON.stringify(command));
-  };
-
-  const handleToggleAlgorithm = () => {
-    sendCommand({ type: 'toggle_algorithm' });
-  };
-
-  const handleInjectDelay = (busId) => {
-    setDelayedBus(busId);
-    sendCommand({ type: 'inject_delay', bus_id: busId });
-    setTimeout(() => setDelayedBus(null), 30000);
-  };
-
-  const handleMoveBus = (busId) => {
-    sendCommand({ type: 'move_bus', bus_id: busId });
-  };
-
-  const handleStopBus = (busId) => {
-    sendCommand({ type: 'stop_bus', bus_id: busId });
-  };
-
-  const handleReset = () => {
-    sendCommand({ type: 'reset' });
-  };
-
-  // =========================================================================
-  // HELPERS
-  // =========================================================================
-
-  const getBusColor = (busId) => {
-    switch (busId) {
-      case 'bus_1': return '#ef4444';
-      case 'bus_2': return '#3b82f6';
-      case 'bus_3': return '#10b981';
-      default: return '#6b7280';
-    }
-  };
-
-  const getGapStatus = (gapKm) => {
-    // Based on new algorithm thresholds
-    if (gapKm < 2.0) return { color: 'bg-red-900', border: 'border-red-500', text: 'text-red-200', status: '🔴 Critical' };
-    if (gapKm < 2.7) return { color: 'bg-yellow-900', border: 'border-yellow-500', text: 'text-yellow-200', status: '🟡 Warning' };
-    return { color: 'bg-green-900', border: 'border-green-600', text: 'text-green-300', status: '🟢 Good' };
-  };
+  useEffect(() => {
+    connectWebSocket();
+    return () => {
+      if (wsRef.current) {
+        wsRef.current.close();
+      }
+    };
+  }, [connectWebSocket]);
 
   // =========================================================================
   // RENDER
   // =========================================================================
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 text-white">
-      <div className="h-screen flex flex-col">
-        {/* Header */}
-        <div className="bg-slate-900 border-b border-slate-700 p-4 shadow-lg">
-          <div className="max-w-full mx-auto">
-            <h1 className="text-3xl font-bold mb-2 bg-gradient-to-r from-cyan-400 to-blue-500 bg-clip-text text-transparent">
-              🚌 Bus Bunching Control System v2.0
-            </h1>
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                <div className={`w-3 h-3 rounded-full ${connected ? 'bg-green-500 animate-pulse' : 'bg-red-500'}`}></div>
-                <span className="text-sm font-mono text-slate-400">
-                  {connected ? '🟢 Connected' : '🔴 Disconnected'}
-                </span>
-              </div>
-              <span className="text-sm text-slate-400">OpenStreetMap • {stops.length} stops • {buses.length} buses</span>
-            </div>
+    <div className="w-full h-screen bg-gray-900 text-white flex flex-col">
+      {/* HEADER */}
+      <div className="bg-gradient-to-r from-blue-600 to-blue-800 p-4 shadow-lg">
+        <div className="max-w-7xl mx-auto flex items-center justify-between">
+          <div>
+            <h1 className="text-3xl font-bold">🚌 Bus Tracking System</h1>
+            <p className="text-blue-100 text-sm">Real-time monitoring with proximity alerts</p>
           </div>
-        </div>
-
-        {/* Main Content */}
-        <div className="flex flex-1 overflow-hidden">
-          {/* Map Panel (75%) */}
-          <div className="flex-1 relative bg-slate-800 border-r border-slate-700 overflow-hidden">
-            <div 
-              id="map" 
-              style={{ 
-                width: '100%', 
-                height: '100%',
-                background: '#64748b'
-              }} 
-              className="z-10"
-            ></div>
-            {!mapInitialized && (
-              <div className="absolute inset-0 flex items-center justify-center bg-slate-900 bg-opacity-50 z-20">
-                <div className="text-center">
-                  <div className="animate-spin w-12 h-12 border-4 border-cyan-500 border-t-transparent rounded-full mx-auto mb-4"></div>
-                  <p className="text-slate-300">Loading map... ({stops.length} stops received)</p>
-                </div>
-              </div>
-            )}
-          </div>
-
-          {/* Control Panel (25%) */}
-          <div className="w-80 bg-slate-800 border-l border-slate-700 overflow-y-auto flex flex-col">
-            {/* Algorithm Control */}
-            <div className="p-4 border-b border-slate-700">
-              <h3 className="text-sm font-semibold text-cyan-400 mb-3">Algorithm Control</h3>
-              <button
-                onClick={handleToggleAlgorithm}
-                className={`w-full py-2 px-3 rounded-lg font-semibold text-sm transition-all ${
-                  algorithmEnabled
-                    ? 'bg-green-600 hover:bg-green-700 text-white border border-green-500'
-                    : 'bg-red-600 hover:bg-red-700 text-white border border-red-500'
-                }`}
-              >
-                {algorithmEnabled ? '✓ Active' : '✕ Disabled'}
-              </button>
-            </div>
-
-            {/* Spacing Metrics */}
-            <div className="p-4 border-b border-slate-700">
-              <h3 className="text-sm font-semibold text-cyan-400 mb-3">Spacing (km)</h3>
-              <div className="space-y-2 max-h-40 overflow-y-auto">
-                {Object.entries(gaps).map(([key, value]) => {
-                  const status = getGapStatus(value);
-                  return (
-                    <div key={key} className={`p-2 rounded text-xs ${status.color} ${status.border} border ${status.text}`}>
-                      <div className="flex justify-between">
-                        <span className="font-mono">{key}</span>
-                        <span className="font-bold">{value.toFixed(2)} km</span>
-                      </div>
-                      <div className="text-xs mt-1">{status.status}</div>
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-
-            {/* Bus Controls */}
-            <div className="p-4 border-b border-slate-700">
-              <h3 className="text-sm font-semibold text-cyan-400 mb-3">Bus Controls</h3>
-              <div className="space-y-2">
-                {['bus_1', 'bus_2', 'bus_3'].map((busId) => (
-                  <div key={busId} className="space-y-1">
-                    <div className="flex gap-2">
-                      <button
-                        onClick={() => handleMoveBus(busId)}
-                        className="flex-1 py-2 px-2 rounded text-xs font-semibold bg-green-700 hover:bg-green-600 text-white border border-green-600 transition-all"
-                      >
-                        ▶ Move {busId}
-                      </button>
-                      <button
-                        onClick={() => handleStopBus(busId)}
-                        className="flex-1 py-2 px-2 rounded text-xs font-semibold bg-red-700 hover:bg-red-600 text-white border border-red-600 transition-all"
-                      >
-                        ⏹ Stop {busId}
-                      </button>
-                    </div>
-                    <button
-                      onClick={() => handleInjectDelay(busId)}
-                      disabled={delayedBus !== null}
-                      className={`w-full py-2 px-2 rounded text-xs font-semibold transition-all ${
-                        delayedBus === busId
-                          ? 'bg-yellow-600 text-white'
-                          : delayedBus !== null
-                          ? 'bg-slate-700 text-slate-500 opacity-50'
-                          : 'bg-slate-700 hover:bg-slate-600 text-slate-200 border border-slate-600'
-                      }`}
-                    >
-                      {delayedBus === busId ? '🚦 Delay...' : `🚦 Traffic ${busId}`}
-                    </button>
-                  </div>
-                ))}
-              </div>
-            </div>
-
-            {/* Reset Button */}
-            <div className="p-4 border-b border-slate-700">
-              <button
-                onClick={handleReset}
-                className="w-full py-2 px-3 rounded-lg font-semibold text-sm bg-slate-700 hover:bg-slate-600 text-slate-200 border border-slate-600 transition-all"
-              >
-                ↻ Reset Simulation
-              </button>
-            </div>
-
-            {/* System Info */}
-            <div className="p-4 border-b border-slate-700">
-              <h3 className="text-sm font-semibold text-cyan-400 mb-2">System Info</h3>
-              <div className="text-xs text-slate-400 space-y-1 font-mono">
-                <p>• Route: 20 km intercity</p>
-                <p>• Stops: {stops.length}</p>
-                <p>• Buses: {buses.length}</p>
-                <p>• Target Gap: 6.7 km</p>
-                <p>• Threshold: 2.0 km</p>
-              </div>
-            </div>
-
-            {/* Activity Log */}
-            <div className="flex-1 flex flex-col p-4 overflow-hidden">
-              <h3 className="text-sm font-semibold text-cyan-400 mb-2">Activity Log</h3>
-              <div className="flex-1 bg-slate-900 rounded-lg p-3 overflow-y-auto border border-slate-700 font-mono text-xs space-y-1">
-                {eventLog.length === 0 ? (
-                  <p className="text-slate-500">Waiting for events...</p>
-                ) : (
-                  eventLog.slice(-20).map((event, idx) => (
-                    <div
-                      key={idx}
-                      className={`leading-tight ${
-                        event.includes('🚨') || event.includes('🛑')
-                          ? 'text-red-400'
-                          : event.includes('✅')
-                          ? 'text-green-400'
-                          : event.includes('🚦')
-                          ? 'text-yellow-400'
-                          : 'text-slate-400'
-                      }`}
-                    >
-                      {event}
-                    </div>
-                  ))
-                )}
-                <div ref={logEndRef} />
-              </div>
-            </div>
-
-            {/* DEBUG INFO */}
-            <div className="p-4 border-t border-slate-700 bg-slate-900 text-xs text-slate-400 max-h-32 overflow-y-auto">
-              <p className="font-bold text-cyan-400 mb-1">DEBUG</p>
-              <p>Connected: {connected ? '✓' : '✗'}</p>
-              <p>Stops: {stops.length}</p>
-              <p>Buses: {buses.length}</p>
-              <p>Map Init: {mapInitialized ? '✓' : '✗'}</p>
-              {buses.length > 0 && (
-                <div className="mt-2 border-t border-slate-700 pt-2">
-                  <p>Bus positions:</p>
-                  {buses.map(b => (
-                    <p key={b.id} className="text-blue-400">
-                      {b.id}: ({b.latitude?.toFixed(4)}, {b.longitude?.toFixed(4)})
-                    </p>
-                  ))}
-                </div>
-              )}
-            </div>
+          <div className="flex gap-2 items-center">
+            <span className={`px-3 py-1 rounded-full text-sm font-semibold ${
+              connected ? 'bg-green-500' : 'bg-red-500'
+            }`}>
+              {connected ? '🟢 Connected' : '🔴 Disconnected'}
+            </span>
+            <button
+              onClick={toggleAdminMode}
+              className={`px-4 py-2 rounded-lg font-semibold transition ${
+                adminMode
+                  ? 'bg-red-600 hover:bg-red-700'
+                  : 'bg-gray-700 hover:bg-gray-600'
+              }`}
+            >
+              👨‍💼 Admin {adminMode ? 'ON' : 'OFF'}
+            </button>
           </div>
         </div>
       </div>
+
+      {/* MAIN CONTENT */}
+      <div className="flex-1 flex gap-4 overflow-hidden p-4">
+        {/* MAP */}
+        <div className="flex-1 rounded-lg overflow-hidden shadow-lg border-2 border-blue-600">
+          <div id="map" className="w-full h-full"></div>
+        </div>
+
+        {/* SIDEBAR */}
+        <div className="w-96 flex flex-col gap-4 overflow-hidden">
+          {/* BUSES PANEL */}
+          <div className="bg-gray-800 rounded-lg shadow-lg flex-1 overflow-hidden flex flex-col border-l-4 border-blue-600">
+            <div className="bg-gray-700 p-3 font-bold text-lg">
+              🚍 Buses ({buses.length})
+            </div>
+            <div className="overflow-y-auto flex-1 p-3 space-y-2">
+              {buses.map((bus) => (
+                <div
+                  key={bus.id}
+                  onClick={() => setSelectedBus(selectedBus === bus.id ? null : bus.id)}
+                  className={`p-3 rounded-lg cursor-pointer transition border-2 ${
+                    selectedBus === bus.id
+                      ? 'border-yellow-400 bg-gray-700'
+                      : 'border-gray-600 bg-gray-750 hover:bg-gray-700'
+                  } ${
+                    bus.alert_level === 'critical'
+                      ? 'border-red-500 bg-red-900'
+                      : bus.alert_level === 'warning'
+                      ? 'border-orange-500 bg-orange-900'
+                      : ''
+                  }`}
+                >
+                  <div className="flex justify-between items-start mb-2">
+                    <span className="font-bold">{bus.name}</span>
+                    <span className="text-xs bg-gray-600 px-2 py-1 rounded">
+                      {bus.status}
+                    </span>
+                  </div>
+                  <div className="text-xs text-gray-300 space-y-1">
+                    <div>Speed: {bus.speed.toFixed(1)} km/h</div>
+                    <div>Heading: {bus.heading.toFixed(0)}°</div>
+                    <div>Closest: {bus.closest_bus_id} ({bus.closest_distance_km.toFixed(1)} km)</div>
+                  </div>
+
+              {adminMode && selectedBus === bus.id && (
+                <div className="mt-3 pt-3 border-t border-gray-600">
+                  <div className="grid grid-cols-2 gap-2 mb-2">
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        slowDown(bus.id);
+                      }}
+                      className="bg-orange-600 hover:bg-orange-700 px-2 py-2 rounded text-xs font-semibold transition"
+                    >
+                      🚦 Slow Down
+                    </button>
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        speedUp(bus.id);
+                      }}
+                      className="bg-green-600 hover:bg-green-700 px-2 py-2 rounded text-xs font-semibold transition"
+                    >
+                      ⚡ Speed Up
+                    </button>
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        bus.status === 'stopped' ? resumeBus(bus.id) : stopBus(bus.id);
+                      }}
+                      className={`${
+                        bus.status === 'stopped'
+                          ? 'bg-green-600 hover:bg-green-700'
+                          : 'bg-red-600 hover:bg-red-700'
+                      } px-2 py-2 rounded text-xs font-semibold transition`}
+                    >
+                      {bus.status === 'stopped' ? '▶️ Resume' : '⏹️ Stop'}
+                    </button>
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        divertBus(bus.id);
+                      }}
+                      className="bg-purple-600 hover:bg-purple-700 px-2 py-2 rounded text-xs font-semibold transition"
+                    >
+                      🔄 Divert
+                    </button>
+                  </div>
+                </div>
+              )}
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* ALERT THRESHOLDS */}
+          <div className="bg-gray-800 rounded-lg shadow-lg p-3 border-l-4 border-yellow-600">
+            <div className="font-bold text-sm mb-2">⚠️ Alert Thresholds</div>
+            <div className="text-xs space-y-1 text-gray-300">
+              <div>🔴 Critical: &lt; {config.alert_critical_km} km</div>
+              <div>🟠 Warning: {config.alert_critical_km} - {config.alert_warning_km} km</div>
+              <div>🟢 Safe: &gt; {config.alert_warning_km} km</div>
+            </div>
+          </div>
+
+          {adminMode && (
+            <button
+              onClick={resetSystem}
+              className="bg-red-600 hover:bg-red-700 px-4 py-2 rounded-lg font-semibold transition shadow-lg"
+            >
+              🔄 Reset System
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* EVENT LOG FOOTER */}
+      <div className="bg-gray-800 border-t-2 border-blue-600 h-32 overflow-y-auto p-3 font-mono text-xs">
+        <div className="space-y-1">
+          {eventLog.map((event, idx) => (
+            <div key={idx} className="text-gray-300">
+              {event}
+            </div>
+          ))}
+          <div ref={logEndRef} />
+        </div>
+      </div>
+
+      {/* DIVERT ROUTE SELECTION MODAL */}
+      {divertBusId && divertRoutes.length > 0 && (
+        <div className="fixed inset-0 bg-black bg-opacity-70 flex items-center justify-center z-50">
+          <div className="bg-gray-800 rounded-lg p-6 border-2 border-cyan-500 max-w-md shadow-2xl">
+            <h2 className="text-2xl font-bold text-cyan-400 mb-4">
+              🗺️ Select Alternate Route
+            </h2>
+            <p className="text-gray-300 mb-4">
+              Choose one of {divertRoutes.length} available routes for the bus
+            </p>
+            <div className="space-y-3 mb-6">
+              {divertRoutes.map((route, idx) => (
+                <button
+                  key={idx}
+                  onClick={() => selectDivertRoute(idx)}
+                  className="w-full bg-cyan-600 hover:bg-cyan-700 text-white font-bold py-3 px-4 rounded-lg transition border-2 border-cyan-500 hover:border-cyan-300"
+                >
+                  Route {idx + 1} ({route.length} waypoints)
+                </button>
+              ))}
+            </div>
+            <button
+              onClick={() => {
+                setDivertBusId(null);
+                setDivertRoutes([]);
+                Object.values(routePolylinesRef.current).forEach(polyline => {
+                  if (mapRef.current) mapRef.current.removeLayer(polyline);
+                });
+                routePolylinesRef.current = {};
+              }}
+              className="w-full bg-gray-700 hover:bg-gray-600 text-gray-300 font-semibold py-2 px-4 rounded-lg transition"
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 };
 
-export default BusBunchingApp;
+export default BusTrackingApp;
